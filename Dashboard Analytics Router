@@ -1,0 +1,69 @@
+from datetime import datetime, timedelta
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from ..database import get_db
+from ..models import URLScan
+from ..schemas import DashboardStatsResponse, ScanHistoryItem
+
+router = APIRouter(prefix="/api/dashboard", tags=["Dashboard"])
+
+@router.get("/stats", response_model=DashboardStatsResponse)
+def get_dashboard_stats(db: Session = Depends(get_db)):
+    total_scans = db.query(func.count(URLScan.Scan_ID)).scalar() or 0
+    safe_scans = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Classification == "Safe").scalar() or 0
+    suspicious_scans = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Classification == "Suspicious").scalar() or 0
+    malicious_scans = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Classification == "Malicious").scalar() or 0
+    
+    avg_score = db.query(func.avg(URLScan.Risk_Score)).scalar() or 0.0
+
+    recent = db.query(URLScan).order_by(URLScan.Scan_Date.desc()).limit(10).all()
+    recent_items = [
+        ScanHistoryItem(
+            scan_id=r.Scan_ID,
+            url=r.URL,
+            risk_score=r.Risk_Score,
+            classification=r.Classification,
+            threat_type=r.Threat_Type,
+            scan_date=r.Scan_Date,
+            recommendation=r.Recommendation
+        )
+        for r in recent
+    ]
+
+    threat_counts = (
+        db.query(URLScan.Threat_Type, func.count(URLScan.Scan_ID))
+        .group_by(URLScan.Threat_Type)
+        .all()
+    )
+    threat_dist = {t_type: count for t_type, count in threat_counts}
+
+    daily_trend = []
+    now = datetime.utcnow()
+    for i in range(6, -1, -1):
+        day_date = now - timedelta(days=i)
+        day_str = day_date.strftime("%b %d")
+        start = day_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = day_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        day_total = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Scan_Date >= start, URLScan.Scan_Date <= end).scalar() or 0
+        day_mal = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Scan_Date >= start, URLScan.Scan_Date <= end, URLScan.Classification == "Malicious").scalar() or 0
+        day_safe = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Scan_Date >= start, URLScan.Scan_Date <= end, URLScan.Classification == "Safe").scalar() or 0
+        
+        daily_trend.append({
+            "date": day_str,
+            "total": day_total,
+            "malicious": day_mal,
+            "safe": day_safe
+        })
+
+    return {
+        "total_scans": total_scans,
+        "safe_scans": safe_scans,
+        "suspicious_scans": suspicious_scans,
+        "malicious_scans": malicious_scans,
+        "avg_risk_score": round(float(avg_score), 1),
+        "recent_scans": recent_items,
+        "threat_distribution": threat_dist,
+        "daily_trend": daily_trend
+    }
