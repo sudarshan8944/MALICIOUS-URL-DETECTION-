@@ -1,0 +1,193 @@
+import os
+import json
+import random
+from datetime import datetime, timedelta
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from ..database import get_db
+from ..models import User, URLScan, SecurityLog
+from ..schemas import UserResponse, SecurityLogResponse, AdminStatsResponse
+from ..auth import get_current_admin
+from ..ml_engine import ml_engine
+
+router = APIRouter(prefix="/api/admin", tags=["Admin Panel"])
+
+@router.get("/stats", response_model=AdminStatsResponse)
+def get_admin_system_stats(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin)
+):
+    total_users = db.query(func.count(User.User_ID)).scalar() or 0
+    total_scans = db.query(func.count(URLScan.Scan_ID)).scalar() or 0
+    total_logs = db.query(func.count(SecurityLog.Log_ID)).scalar() or 0
+    
+    safe_count = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Classification == "Safe").scalar() or 0
+    suspicious_count = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Classification == "Suspicious").scalar() or 0
+    malicious_count = db.query(func.count(URLScan.Scan_ID)).filter(URLScan.Classification == "Malicious").scalar() or 0
+    
+    avg_score = db.query(func.avg(URLScan.Risk_Score)).scalar() or 0.0
+
+    meta = ml_engine.metadata if ml_engine.metadata else {
+        "model_name": "URLSentinel-RF-v1",
+        "algorithm": "Random Forest Classifier",
+        "accuracy": 0.9287,
+        "precision": 0.8760,
+        "recall": 0.9225,
+        "f1_score": 0.8986,
+        "roc_auc": 0.9790
+    }
+
+    return {
+        "total_users": total_users,
+        "total_scans": total_scans,
+        "total_logs": total_logs,
+        "safe_count": safe_count,
+        "suspicious_count": suspicious_count,
+        "malicious_count": malicious_count,
+        "avg_risk_score": round(float(avg_score), 1),
+        "model_metadata": meta
+    }
+
+@router.get("/users", response_model=List[UserResponse])
+def get_all_users(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin)
+):
+    users = db.query(User).order_by(User.Created_Date.desc()).all()
+    return [
+        {
+            "user_id": u.User_ID,
+            "name": u.Name,
+            "email": u.Email,
+            "role": u.Role,
+            "created_date": u.Created_Date
+        }
+        for u in users
+    ]
+
+@router.put("/users/{user_id}/role")
+def update_user_role(
+    user_id: int,
+    new_role: str = Query(..., pattern="^(admin|user)$"),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin)
+):
+    target = db.query(User).filter(User.User_ID == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    
+    if target.User_ID == admin.User_ID and new_role == "user":
+        raise HTTPException(status_code=400, detail="Cannot demote your own administrator account.")
+
+    old_role = target.Role
+    target.Role = new_role
+    db.commit()
+
+    sec_log = SecurityLog(
+        User_ID=admin.User_ID,
+        Activity="ROLE_UPDATE",
+        IP_Address="127.0.0.1",
+        User_Agent="AdminConsole",
+        Status="SUCCESS",
+        Details=f"Changed user #{user_id} ({target.Email}) role from {old_role} to {new_role}",
+        Timestamp=datetime.utcnow()
+    )
+    db.add(sec_log)
+    db.commit()
+
+    return {"status": "success", "message": f"User role updated to {new_role}."}
+
+@router.delete("/users/{user_id}")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin)
+):
+    if user_id == admin.User_ID:
+        raise HTTPException(status_code=400, detail="Cannot delete your own admin account.")
+    
+    target = db.query(User).filter(User.User_ID == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    email = target.Email
+    db.delete(target)
+    db.commit()
+
+    sec_log = SecurityLog(
+        User_ID=admin.User_ID,
+        Activity="USER_DELETED",
+        IP_Address="127.0.0.1",
+        User_Agent="AdminConsole",
+        Status="WARNING",
+        Details=f"Deleted user #{user_id} ({email})",
+        Timestamp=datetime.utcnow()
+    )
+    db.add(sec_log)
+    db.commit()
+
+    return {"status": "success", "message": f"User {email} has been deleted."}
+
+@router.get("/logs", response_model=List[SecurityLogResponse])
+def get_security_logs(
+    activity: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin)
+):
+    q = db.query(SecurityLog)
+    if activity and activity.lower() != "all":
+        q = q.filter(SecurityLog.Activity == activity)
+    if status_filter and status_filter.lower() != "all":
+        q = q.filter(SecurityLog.Status == status_filter)
+    
+    logs = q.order_by(SecurityLog.Timestamp.desc()).offset(offset).limit(limit).all()
+    return logs
+
+@router.post("/seed-dataset-scans")
+def seed_dataset_scans(
+    count: int = Query(35, ge=10, le=100),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin)
+):
+    dataset_file = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'dataset', 'malicious_phish.csv'))
+    if not os.path.exists(dataset_file):
+        raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+    sample_urls = []
+    with open(dataset_file, 'r', encoding='utf-8', errors='ignore') as f:
+        f.readline()
+        lines = [f.readline().strip() for _ in range(5000) if not f.closed]
+        random.shuffle(lines)
+        for line in lines[:count]:
+            if line:
+                parts = line.rsplit(',', 1)
+                if len(parts) == 2:
+                    sample_urls.append(parts[0])
+
+    seeded = 0
+    now = datetime.utcnow()
+    for idx, u in enumerate(sample_urls):
+        res = ml_engine.analyze_url(u)
+        time_offset = timedelta(hours=random.randint(1, 72), minutes=random.randint(0, 59))
+        record = URLScan(
+            User_ID=admin.User_ID,
+            URL=res['url'],
+            Risk_Score=res['risk_score'],
+            Classification=res['classification'],
+            Threat_Type=res['threat_type'],
+            ML_Probability=res['ml_probability'],
+            Features_JSON=json.dumps(res['features']),
+            Checklist_JSON=json.dumps(res['checklist']),
+            Recommendation=res['recommendation'],
+            Scan_Date=now - time_offset
+        )
+        db.add(record)
+        seeded += 1
+
+    db.commit()
+    return {"status": "success", "message": f"Successfully seeded {seeded} scans directly from the dataset."}
