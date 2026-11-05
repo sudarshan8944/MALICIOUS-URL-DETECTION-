@@ -1,0 +1,164 @@
+import os
+import sys
+import time
+import json
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+import joblib
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from app.feature_extractor import extract_url_features
+
+DATASET_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'dataset', 'malicious_phish.csv'))
+MODEL_DIR = os.path.abspath(os.path.dirname(__file__))
+MODEL_FILE = os.path.join(MODEL_DIR, 'model.joblib')
+META_FILE = os.path.join(MODEL_DIR, 'model_meta.json')
+
+def train_model():
+    print(f"[*] Checking dataset at {DATASET_PATH}...")
+    if not os.path.exists(DATASET_PATH):
+        raise FileNotFoundError(f"Dataset not found at {DATASET_PATH}")
+    
+    start_time = time.time()
+    print("[*] Reading dataset...")
+    df = pd.read_csv(DATASET_PATH)
+    print(f"[*] Total dataset rows: {len(df)}")
+    print("[*] Class distribution:\n", df['type'].value_counts())
+
+    # Map target: 0 for benign (Safe), 1 for malicious (phishing, malware, defacement)
+    df['is_malicious'] = df['type'].apply(lambda t: 0 if str(t).lower() == 'benign' else 1)
+    
+    # Curated benign root and common URLs to balance dataset representation of clean domains
+    popular_benign = [
+        "google.com", "https://www.google.com", "https://google.com/search?q=cybersecurity",
+        "youtube.com", "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "wikipedia.org", "https://en.wikipedia.org/wiki/Phishing", "https://wikipedia.org",
+        "github.com", "https://github.com/torvalds/linux", "https://github.com",
+        "microsoft.com", "https://www.microsoft.com/en-us/", "apple.com", "https://www.apple.com",
+        "amazon.com", "https://www.amazon.com/dp/B08N5WRWNW", "reddit.com", "https://reddit.com/r/python",
+        "stackoverflow.com", "https://stackoverflow.com/questions/12345", "linkedin.com",
+        "netflix.com", "twitter.com", "instagram.com", "facebook.com", "cloudflare.com",
+        "python.org", "https://docs.python.org/3/library/urllib.parse.html",
+        "fastapi.tiangolo.com", "https://fastapi.tiangolo.com/tutorial/",
+        "react.dev", "https://react.dev/learn", "npmjs.com", "https://www.npmjs.com/package/react",
+        "bbc.com", "https://www.bbc.com/news", "cnn.com", "https://edition.cnn.com",
+        "nytimes.com", "nature.com", "mit.edu", "harvard.edu", "stanford.edu",
+        "ieee.org", "acm.org", "sciencedirect.com", "arxiv.org", "nih.gov", "who.int"
+    ]
+    augmented_benign = []
+    for u in popular_benign:
+        for _ in range(50):
+            augmented_benign.append({"url": u, "type": "benign", "is_malicious": 0})
+    
+    df_aug = pd.DataFrame(augmented_benign)
+    df = pd.concat([df, df_aug], ignore_index=True)
+
+    SAMPLE_SIZE = min(80000, len(df))
+    print(f"[*] Sampling {SAMPLE_SIZE} records stratified by type...")
+    df_sample, _ = train_test_split(
+        df, train_size=SAMPLE_SIZE, stratify=df['type'], random_state=42
+    )
+    df_sample = df_sample.reset_index(drop=True)
+    
+    print(f"[*] Sampled {len(df_sample)} records. Extracting features...")
+    feature_list = []
+    labels = []
+    subtypes = []
+    
+    for idx, row in df_sample.iterrows():
+        url_str = str(row['url'])
+        feat = extract_url_features(url_str)['features']
+        feature_list.append(feat)
+        labels.append(int(row['is_malicious']))
+        subtypes.append(str(row['type']))
+        if idx > 0 and idx % 20000 == 0:
+            print(f"    Processed {idx}/{len(df_sample)} URLs...")
+            
+    X = pd.DataFrame(feature_list)
+    y = np.array(labels)
+    subtypes_arr = np.array(subtypes)
+    feature_names = list(X.columns)
+    
+    print(f"[*] Extracted {len(feature_names)} features: {feature_names}")
+    
+    X_train, X_test, y_train, y_test, sub_train, sub_test = train_test_split(
+        X, y, subtypes_arr, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    print(f"[*] Training RandomForestClassifier on {len(X_train)} samples...")
+    rf = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=22,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+    
+    print("[*] Evaluating model on test set...")
+    y_pred = rf.predict(X_test)
+    y_prob = rf.predict_proba(X_test)[:, 1]
+    
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred)
+    rec = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    roc_auc = roc_auc_score(y_test, y_prob)
+    cm = confusion_matrix(y_test, y_pred).tolist()
+    
+    importances = rf.feature_importances_
+    feat_imp = sorted(
+        [{"feature": name, "importance": round(float(imp), 4)} for name, imp in zip(feature_names, importances)],
+        key=lambda x: x["importance"],
+        reverse=True
+    )
+    
+    print(f"[*] Accuracy:  {acc * 100:.2f}%")
+    print(f"[*] Precision: {prec * 100:.2f}%")
+    print(f"[*] Recall:    {rec * 100:.2f}%")
+    print(f"[*] F1-Score:  {f1 * 100:.2f}%")
+    print(f"[*] ROC-AUC:   {roc_auc:.4f}")
+    
+    joblib.dump({
+        'model': rf,
+        'feature_names': feature_names,
+        'algorithm': 'RandomForestClassifier'
+    }, MODEL_FILE)
+    
+    elapsed = round(time.time() - start_time, 2)
+    meta = {
+        "model_name": "URLSentinel-RF-v1",
+        "algorithm": "Random Forest Classifier",
+        "n_estimators": 100,
+        "features": feature_names,
+        "dataset_total_records": len(df),
+        "trained_samples": len(X_train),
+        "test_samples": len(X_test),
+        "accuracy": round(float(acc), 4),
+        "precision": round(float(prec), 4),
+        "recall": round(float(rec), 4),
+        "f1_score": round(float(f1), 4),
+        "roc_auc": round(float(roc_auc), 4),
+        "confusion_matrix": {
+            "true_negative": cm[0][0],
+            "false_positive": cm[0][1],
+            "false_negative": cm[1][0],
+            "true_positive": cm[1][1]
+        },
+        "feature_importances": feat_imp,
+        "training_time_seconds": elapsed,
+        "trained_date": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    with open(META_FILE, 'w') as f:
+        json.dump(meta, f, indent=2)
+        
+    print(f"[OK] Training complete in {elapsed}s!")
+
+if __name__ == '__main__':
+    train_model()
