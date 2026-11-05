@@ -1,0 +1,158 @@
+import os
+import json
+import random
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from .database import engine, Base, get_db
+from .models import User, URLScan, SecurityLog
+from .auth import hash_password
+from .ml_engine import ml_engine
+from .routers import auth, scan, dashboard, admin
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title="URLSentinel API – Malicious URL Detection & Cyber Threat Analysis System",
+    description="Full Stack Cybersecurity and Machine Learning Platform for Malicious URL Detection (FSD + CY Project)",
+    version="1.0.0"
+)
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth.router)
+app.include_router(scan.router)
+app.include_router(dashboard.router)
+app.include_router(admin.router)
+
+# Mount frontend static build if present for single-port full-stack execution
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'frontend', 'dist'))
+if os.path.exists(FRONTEND_DIST):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    def serve_frontend_spa(full_path: str):
+        if full_path.startswith("api") or full_path.startswith("docs") or full_path.startswith("openapi.json"):
+            return None
+        file_path = os.path.join(FRONTEND_DIST, full_path)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+
+def seed_initial_data():
+    """Seeds team members and sample dataset scans on startup if database is empty."""
+    from .database import SessionLocal
+    db = SessionLocal()
+    try:
+        if db.query(User).count() == 0:
+            print("[*] Seeding default team users and admin...")
+            admin_user = User(
+                Name="Security Operations Admin",
+                Email="admin@urlsentinel.com",
+                Password_Hash=hash_password("Admin@123"),
+                Role="admin",
+                Created_Date=datetime.utcnow() - timedelta(days=30)
+            )
+            sudarshan = User(
+                Name="Sudarshan S (B1)",
+                Email="sudarshan@urlsentinel.com",
+                Password_Hash=hash_password("Sudarshan@123"),
+                Role="admin",
+                Created_Date=datetime.utcnow() - timedelta(days=25)
+            )
+            yashwanth = User(
+                Name="Yashwanth MP (B2)",
+                Email="yashwanth@urlsentinel.com",
+                Password_Hash=hash_password("Yashwanth@123"),
+                Role="admin",
+                Created_Date=datetime.utcnow() - timedelta(days=25)
+            )
+            db.add_all([admin_user, sudarshan, yashwanth])
+            db.commit()
+            print("[OK] Default users created successfully.")
+
+        if db.query(URLScan).count() == 0:
+            print("[*] Seeding initial URL scans from dataset...")
+            curated_samples = [
+                "https://google.com",
+                "http://secure-login-example.xyz/account",
+                "http://192.168.1.1/admin/login.php",
+                "https://wikipedia.org/wiki/Cybersecurity",
+                "http://bit.ly/claim-free-paypal-bonus-now",
+                "http://www.garage-pirenne.be/index.php?option=com_content&view=article&id=70",
+                "https://github.com/torvalds/linux",
+                "http://br-icloud.com.br",
+                "http://buzzfil.net/m/show-art/ils-etaient-loin-de-s-imaginer",
+                "http://secure3ds.h19.ru/verify-account",
+                "https://stackoverflow.com/questions/malicious-url-detection",
+                "http://ebasy.xgsm.pl?eBay.com.wbdllsc.login.submit",
+                "https://fastapi.tiangolo.com",
+                "http://steamglfts.h16.ru/free-csgo-skins",
+                "http://paypal-verification-update.secure-portal.info/login"
+            ]
+
+            admin_u = db.query(User).filter(User.Role == "admin").first()
+            uid = admin_u.User_ID if admin_u else None
+            now = datetime.utcnow()
+
+            for idx, u in enumerate(curated_samples):
+                res = ml_engine.analyze_url(u)
+                time_offset = timedelta(days=random.randint(0, 6), hours=random.randint(0, 23))
+                record = URLScan(
+                    User_ID=uid,
+                    URL=res['url'],
+                    Risk_Score=res['risk_score'],
+                    Classification=res['classification'],
+                    Threat_Type=res['threat_type'],
+                    ML_Probability=res['ml_probability'],
+                    Features_JSON=json.dumps(res['features']),
+                    Checklist_JSON=json.dumps(res['checklist']),
+                    Recommendation=res['recommendation'],
+                    Scan_Date=now - time_offset
+                )
+                db.add(record)
+
+            db.commit()
+            print("[OK] Initial URL scans seeded.")
+    except Exception as e:
+        print(f"[!] Error seeding initial data: {e}")
+    finally:
+        db.close()
+
+@app.on_event("startup")
+def on_startup():
+    seed_initial_data()
+
+@app.get("/")
+def root():
+    return {
+        "project": "URLSentinel",
+        "description": "Full Stack Malicious URL Detection and Cyber Threat Analysis System",
+        "team": ["Sudarshan S (B1)", "Yashwanth MP (B2)"],
+        "status": "online",
+        "model_loaded": ml_engine.model is not None,
+        "api_docs": "/docs"
+    }
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": "sqlite_connected",
+        "ml_engine": "active"
+    }
