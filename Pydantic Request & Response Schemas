@@ -1,0 +1,100 @@
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field
+
+# User Schemas
+class UserRegister(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., min_length=3, max_length=150)
+    password: str = Field(..., min_length=6, max_length=100)
+    role: Optional[str] = "user"
+
+class UserLogin(BaseModel):
+    email: str = Field(..., min_length=3, max_length=150)
+    password: str
+
+class UserResponse(BaseModel):
+    user_id: int
+    name: str
+    email: str
+    role: str
+    created_date: datetime
+
+    class Config:
+        from_attributes = True
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+# Scan Schemas
+class ScanRequest(BaseModel):
+    url: str = Field(..., min_length=3, max_length=2048)
+
+class BatchScanRequest(BaseModel):
+    urls: List[str] = Field(..., min_items=1, max_items=50)
+
+class ScanResponse(BaseModel):
+    scan_id: Optional[int] = None
+    user_id: Optional[int] = None
+    url: str
+    risk_score: int
+    classification: str
+    threat_level: str
+    threat_color: str
+    threat_type: str
+    ml_probability: float
+    features: Dict[str, Any]
+    details: Dict[str, Any]
+    checklist: Dict[str, Any]
+    recommendation: str
+    scan_date: Optional[datetime] = None
+
+class ScanHistoryItem(BaseModel):
+    scan_id: int
+    url: str
+    risk_score: int
+    classification: str
+    threat_type: str
+    scan_date: datetime
+    recommendation: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+# Dashboard Schemas
+class DashboardStatsResponse(BaseModel):
+    total_scans: int
+    safe_scans: int
+    suspicious_scans: int
+    malicious_scans: int
+    avg_risk_score: float
+    recent_scans: List[ScanHistoryItem]
+    threat_distribution: Dict[str, int]
+    daily_trend: List[Dict[str, Any]]
+
+# Security Log Schema
+class SecurityLogResponse(BaseModel):
+    log_id: int
+    user_id: Optional[int]
+    activity: str
+    ip_address: str
+    user_agent: str
+    status: str
+    details: Optional[str]
+    timestamp: datetime
+
+    class Config:
+        from_attributes = True
+
+# Admin Schemas
+class AdminStatsResponse(BaseModel):
+    total_users: int
+    total_scans: int
+    total_logs: int
+    safe_count: int
+    suspicious_count: int
+    malicious_count: int
+    avg_risk_score: float
+    model_metadata: Dict[str, Any]
