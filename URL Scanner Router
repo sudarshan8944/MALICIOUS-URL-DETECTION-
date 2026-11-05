@@ -1,0 +1,251 @@
+import json
+import csv
+import io
+from datetime import datetime
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response
+from sqlalchemy.orm import Session
+from ..database import get_db
+from ..models import URLScan, SecurityLog, User
+from ..schemas import ScanRequest, BatchScanRequest, ScanResponse, ScanHistoryItem
+from ..ml_engine import ml_engine
+from ..auth import get_optional_user, get_current_user
+
+router = APIRouter(prefix="/api/scans", tags=["URL Scanner"])
+
+@router.post("/", response_model=ScanResponse)
+def scan_url(
+    req: ScanRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user)
+):
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL cannot be empty.")
+        
+    analysis = ml_engine.analyze_url(url)
+    
+    user_id = current_user.User_ID if current_user else None
+    scan_record = URLScan(
+        User_ID=user_id,
+        URL=analysis['url'],
+        Risk_Score=analysis['risk_score'],
+        Classification=analysis['classification'],
+        Threat_Type=analysis['threat_type'],
+        ML_Probability=analysis['ml_probability'],
+        Features_JSON=json.dumps(analysis['features']),
+        Checklist_JSON=json.dumps(analysis['checklist']),
+        Recommendation=analysis['recommendation'],
+        Scan_Date=datetime.utcnow()
+    )
+    db.add(scan_record)
+    
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    user_agent = request.headers.get("user-agent", "Unknown")[:250]
+    log_status = "WARNING" if analysis['classification'] == "Suspicious" else ("BLOCKED" if analysis['classification'] == "Malicious" else "SUCCESS")
+    
+    sec_log = SecurityLog(
+        User_ID=user_id,
+        Activity="URL_SCAN",
+        IP_Address=client_ip,
+        User_Agent=user_agent,
+        Status=log_status,
+        Details=f"Scanned: {url[:80]} | Result: {analysis['classification']} ({analysis['risk_score']}/100)",
+        Timestamp=datetime.utcnow()
+    )
+    db.add(sec_log)
+    db.commit()
+    db.refresh(scan_record)
+
+    return {
+        "scan_id": scan_record.Scan_ID,
+        "user_id": user_id,
+        "url": analysis['url'],
+        "risk_score": analysis['risk_score'],
+        "classification": analysis['classification'],
+        "threat_level": analysis['threat_level'],
+        "threat_color": analysis['threat_color'],
+        "threat_type": analysis['threat_type'],
+        "ml_probability": analysis['ml_probability'],
+        "features": analysis['features'],
+        "details": analysis['details'],
+        "checklist": analysis['checklist'],
+        "recommendation": analysis['recommendation'],
+        "scan_date": scan_record.Scan_Date
+    }
+
+@router.post("/batch", response_model=List[ScanResponse])
+def batch_scan(
+    req: BatchScanRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user)
+):
+    results = []
+    user_id = current_user.User_ID if current_user else None
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    user_agent = request.headers.get("user-agent", "Unknown")[:250]
+
+    for raw_url in req.urls:
+        u = raw_url.strip()
+        if not u:
+            continue
+        analysis = ml_engine.analyze_url(u)
+        scan_record = URLScan(
+            User_ID=user_id,
+            URL=analysis['url'],
+            Risk_Score=analysis['risk_score'],
+            Classification=analysis['classification'],
+            Threat_Type=analysis['threat_type'],
+            ML_Probability=analysis['ml_probability'],
+            Features_JSON=json.dumps(analysis['features']),
+            Checklist_JSON=json.dumps(analysis['checklist']),
+            Recommendation=analysis['recommendation'],
+            Scan_Date=datetime.utcnow()
+        )
+        db.add(scan_record)
+        db.flush()
+
+        results.append({
+            "scan_id": scan_record.Scan_ID,
+            "user_id": user_id,
+            "url": analysis['url'],
+            "risk_score": analysis['risk_score'],
+            "classification": analysis['classification'],
+            "threat_level": analysis['threat_level'],
+            "threat_color": analysis['threat_color'],
+            "threat_type": analysis['threat_type'],
+            "ml_probability": analysis['ml_probability'],
+            "features": analysis['features'],
+            "details": analysis['details'],
+            "checklist": analysis['checklist'],
+            "recommendation": analysis['recommendation'],
+            "scan_date": scan_record.Scan_Date
+        })
+
+    sec_log = SecurityLog(
+        User_ID=user_id,
+        Activity="BATCH_URL_SCAN",
+        IP_Address=client_ip,
+        User_Agent=user_agent,
+        Status="SUCCESS",
+        Details=f"Batch scanned {len(results)} URLs",
+        Timestamp=datetime.utcnow()
+    )
+    db.add(sec_log)
+    db.commit()
+    return results
+
+@router.get("/history", response_model=List[ScanHistoryItem])
+def get_scan_history(
+    classification: Optional[str] = Query(None),
+    query: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user)
+):
+    q = db.query(URLScan)
+    
+    if current_user and current_user.Role != "admin":
+        q = q.filter(URLScan.User_ID == current_user.User_ID)
+    
+    if classification and classification.lower() != "all":
+        q = q.filter(URLScan.Classification.ilike(classification))
+        
+    if query:
+        q = q.filter(URLScan.URL.ilike(f"%{query}%"))
+        
+    records = q.order_by(URLScan.Scan_Date.desc()).offset(offset).limit(limit).all()
+    
+    return [
+        {
+            "scan_id": r.Scan_ID,
+            "url": r.URL,
+            "risk_score": r.Risk_Score,
+            "classification": r.Classification,
+            "threat_type": r.Threat_Type,
+            "scan_date": r.Scan_Date,
+            "recommendation": r.Recommendation
+        }
+        for r in records
+    ]
+
+@router.get("/export/csv")
+def export_scans_csv(
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user)
+):
+    q = db.query(URLScan)
+    if current_user and current_user.Role != "admin":
+        q = q.filter(URLScan.User_ID == current_user.User_ID)
+    records = q.order_by(URLScan.Scan_Date.desc()).limit(1000).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Scan_ID", "URL", "Risk_Score", "Classification", "Threat_Type", "Scan_Date", "Recommendation"])
+    for r in records:
+        writer.writerow([r.Scan_ID, r.URL, r.Risk_Score, r.Classification, r.Threat_Type, r.Scan_Date.isoformat(), r.Recommendation])
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=urlsentinel_scans_{datetime.utcnow().strftime('%Y%m%d%H%M')}.csv"}
+    )
+
+@router.get("/{scan_id}", response_model=ScanResponse)
+def get_scan_detail(
+    scan_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user)
+):
+    scan = db.query(URLScan).filter(URLScan.Scan_ID == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan record not found.")
+
+    features = json.loads(scan.Features_JSON) if scan.Features_JSON else {}
+    checklist = json.loads(scan.Checklist_JSON) if scan.Checklist_JSON else {}
+
+    if scan.Risk_Score <= 30:
+        threat_level = "LOW"
+        threat_color = "emerald"
+    elif scan.Risk_Score <= 70:
+        threat_level = "MEDIUM"
+        threat_color = "amber"
+    else:
+        threat_level = "HIGH"
+        threat_color = "rose"
+
+    return {
+        "scan_id": scan.Scan_ID,
+        "user_id": scan.User_ID,
+        "url": scan.URL,
+        "risk_score": scan.Risk_Score,
+        "classification": scan.Classification,
+        "threat_level": threat_level,
+        "threat_color": threat_color,
+        "threat_type": scan.Threat_Type,
+        "ml_probability": scan.ML_Probability,
+        "features": features,
+        "details": {},
+        "checklist": checklist,
+        "recommendation": scan.Recommendation or "",
+        "scan_date": scan.Scan_Date
+    }
+
+@router.delete("/{scan_id}")
+def delete_scan(
+    scan_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    scan = db.query(URLScan).filter(URLScan.Scan_ID == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan record not found.")
+    if current_user.Role != "admin" and scan.User_ID != current_user.User_ID:
+        raise HTTPException(status_code=403, detail="You do not have permission to delete this scan.")
+
+    db.delete(scan)
+    db.commit()
+    return {"status": "success", "message": f"Scan #{scan_id} deleted successfully."}
