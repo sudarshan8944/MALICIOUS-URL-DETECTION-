@@ -1,0 +1,48 @@
+from datetime import datetime
+from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
+from .database import Base
+
+class User(Base):
+    __tablename__ = "Users"
+
+    User_ID = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    Name = Column(String(100), nullable=False)
+    Email = Column(String(150), unique=True, index=True, nullable=False)
+    Password_Hash = Column(String(255), nullable=False)
+    Role = Column(String(20), default="user", nullable=False)  # 'admin' or 'user'
+    Created_Date = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    scans = relationship("URLScan", back_populates="user", cascade="all, delete-orphan")
+    logs = relationship("SecurityLog", back_populates="user", cascade="all, delete-orphan")
+
+class URLScan(Base):
+    __tablename__ = "URL_Scans"
+
+    Scan_ID = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    User_ID = Column(Integer, ForeignKey("Users.User_ID", ondelete="SET NULL"), nullable=True, index=True)
+    URL = Column(Text, nullable=False)
+    Risk_Score = Column(Integer, nullable=False)  # 0 to 100
+    Classification = Column(String(30), nullable=False)  # 'Safe', 'Suspicious', 'Malicious'
+    Threat_Type = Column(String(100), nullable=False)
+    ML_Probability = Column(Float, default=0.0)
+    Features_JSON = Column(Text, nullable=True)
+    Checklist_JSON = Column(Text, nullable=True)
+    Recommendation = Column(Text, nullable=True)
+    Scan_Date = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    user = relationship("User", back_populates="scans")
+
+class SecurityLog(Base):
+    __tablename__ = "Security_Logs"
+
+    Log_ID = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    User_ID = Column(Integer, ForeignKey("Users.User_ID", ondelete="SET NULL"), nullable=True, index=True)
+    Activity = Column(String(100), nullable=False, index=True)
+    IP_Address = Column(String(50), default="127.0.0.1")
+    User_Agent = Column(String(255), default="Unknown")
+    Status = Column(String(20), default="SUCCESS")  # SUCCESS, WARNING, BLOCKED
+    Details = Column(Text, nullable=True)
+    Timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    user = relationship("User", back_populates="logs")
