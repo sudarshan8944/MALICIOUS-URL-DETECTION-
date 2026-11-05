@@ -1,0 +1,105 @@
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlalchemy.orm import Session
+from ..database import get_db
+from ..models import User, SecurityLog
+from ..schemas import UserRegister, UserLogin, UserResponse, TokenResponse
+from ..auth import hash_password, verify_password, create_access_token, get_current_user
+
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+
+def log_security_event(db: Session, request: Request, activity: str, status_val: str, details: str = None, user_id: int = None):
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    user_agent = request.headers.get("user-agent", "Unknown")[:250]
+    sec_log = SecurityLog(
+        User_ID=user_id,
+        Activity=activity,
+        IP_Address=client_ip,
+        User_Agent=user_agent,
+        Status=status_val,
+        Details=details,
+        Timestamp=datetime.utcnow()
+    )
+    db.add(sec_log)
+    db.commit()
+
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+def register(user_data: UserRegister, request: Request, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.Email == user_data.email.lower()).first()
+    if existing:
+        log_security_event(db, request, "REGISTER_FAILED", "BLOCKED", f"Email already exists: {user_data.email}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An account with this email address already exists."
+        )
+
+    role = "admin" if user_data.role and user_data.role.lower() == "admin" else "user"
+    
+    new_user = User(
+        Name=user_data.name.strip(),
+        Email=user_data.email.lower().strip(),
+        Password_Hash=hash_password(user_data.password),
+        Role=role,
+        Created_Date=datetime.utcnow()
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    log_security_event(db, request, "USER_REGISTERED", "SUCCESS", f"User registered: {new_user.Email} (Role: {role})", user_id=new_user.User_ID)
+
+    access_token = create_access_token(data={"sub": new_user.Email, "role": new_user.Role})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "user_id": new_user.User_ID,
+            "name": new_user.Name,
+            "email": new_user.Email,
+            "role": new_user.Role,
+            "created_date": new_user.Created_Date
+        }
+    }
+
+@router.post("/login", response_model=TokenResponse)
+def login(login_data: UserLogin, request: Request, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.Email == login_data.email.lower().strip()).first()
+    if not user or not verify_password(login_data.password, user.Password_Hash):
+        log_security_event(
+            db, request, "FAILED_LOGIN", "WARNING",
+            f"Failed login attempt for {login_data.email}",
+            user_id=user.User_ID if user else None
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password combination."
+        )
+
+    log_security_event(
+        db, request, "USER_LOGIN", "SUCCESS",
+        f"User logged in: {user.Email}",
+        user_id=user.User_ID
+    )
+
+    access_token = create_access_token(data={"sub": user.Email, "role": user.Role})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "user_id": user.User_ID,
+            "name": user.Name,
+            "email": user.Email,
+            "role": user.Role,
+            "created_date": user.Created_Date
+        }
+    }
+
+@router.get("/me", response_model=UserResponse)
+def get_me(current_user: User = Depends(get_current_user)):
+    return {
+        "user_id": current_user.User_ID,
+        "name": current_user.Name,
+        "email": current_user.Email,
+        "role": current_user.Role,
+        "created_date": current_user.Created_Date
+    }\
